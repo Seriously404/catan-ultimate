@@ -1,0 +1,16 @@
+{
+  "name": "@catan-ultimate/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit && tsc --noEmit --project tsconfig.node.json",
+    "build": "npm run check && vite build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
+  }
+}

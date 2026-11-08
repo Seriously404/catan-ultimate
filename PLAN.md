@@ -33,6 +33,14 @@ Every command has a seat identity, action type, payload, unique command ID, and 
 
 ## Broad implementation stages, in order
 
+### Foundation checkpoint (2026-11-07)
+
+Installed the Python virtual environment and frontend tooling, added dependency locks,
+strict TypeScript configuration, FastAPI application composition, static frontend hosting,
+a health endpoint, development proxy/run commands, and infrastructure checks. See
+[the setup and file guide](./README.md). This is the prerequisite plumbing for stage 1;
+lobby state, player identities, WebSockets, and persistence remain unimplemented.
+
 ### 1. Server and connection skeleton
 
 Create the package layout, configuration, FastAPI app, single-lobby/game manager, WebSocket protocol, HTTP health endpoint, and a static frontend served by the same process. Add admission to the single lobby, optional invite code, player seat tokens, reconnect, command IDs, revision numbers, and a minimal event journal. Start with a dummy action so two browser tabs can observe the same authoritative state. Define protocol schemas and error codes now, before adding rules.

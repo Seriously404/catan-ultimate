@@ -1,0 +1,24 @@
+{
+  "name": "catan-ultimate",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names api,web npm:dev:server npm:dev:frontend",
+    "dev:server": ".venv/bin/python -m uvicorn catan_server.app:create_app --factory --reload --reload-dir server --host 127.0.0.1 --port 8000",
+    "dev:frontend": "npm run dev --workspace @catan-ultimate/frontend",
+    "build": "npm run build --workspace @catan-ultimate/frontend",
+    "check": "npm run check:server && npm run check:frontend",
+    "check:server": ".venv/bin/python -m ruff check server tests && .venv/bin/python -m ruff format --check server tests && .venv/bin/python -m pytest",
+    "check:frontend": "npm run check --workspace @catan-ultimate/frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7"
+  }
+}

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catan-ultimate"
+version = "0.1.0"
+description = "A single-session Catan server with a browser frontend."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162,<1",
+    "uvicorn[standard]>=0.54,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx2>=2.16,<3",
+    "pytest>=9.2,<10",
+    "ruff>=0.17.4,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["server"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
