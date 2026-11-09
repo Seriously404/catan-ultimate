@@ -9,7 +9,7 @@ from catan_server.app import create_app
 
 
 def test_api_works_without_a_frontend_build(tmp_path: Path) -> None:
-    with TestClient(create_app(frontend_dir=tmp_path)) as client:
+    with TestClient(create_app(frontend_dir=tmp_path, data_dir=tmp_path / "data")) as client:
         response = client.get("/api/health")
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
@@ -29,7 +29,9 @@ def built_frontend(tmp_path: Path) -> Path:
 
 
 def test_built_frontend_and_api_share_one_server(built_frontend: Path) -> None:
-    with TestClient(create_app(frontend_dir=built_frontend)) as client:
+    with TestClient(
+        create_app(frontend_dir=built_frontend, data_dir=built_frontend.parent / "data")
+    ) as client:
         assert "Frontend fixture" in client.get("/").text
         assert client.get("/assets/main.js").status_code == 200
         assert client.get("/api/health").json() == {"status": "ok"}
@@ -40,15 +42,15 @@ def test_built_frontend_and_api_share_one_server(built_frontend: Path) -> None:
     [
         "/api/unknown",
         "/assets/missing.js",
-        "/testing",
-        "/secret",
         "/private.txt",
         "/%2e%2e/private.txt",
         "/assets/%2e%2e/%2e%2e/private.txt",
     ],
 )
 def test_missing_routes_and_external_files_are_not_served(built_frontend: Path, path: str) -> None:
-    with TestClient(create_app(frontend_dir=built_frontend)) as client:
+    with TestClient(
+        create_app(frontend_dir=built_frontend, data_dir=built_frontend.parent / "data")
+    ) as client:
         response = client.get(path)
         assert response.status_code == 404
         assert "Do not serve this." not in response.text

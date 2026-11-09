@@ -2,6 +2,16 @@
 
 ## Target
 
+### Implementation checkpoint — 2026-11-09
+
+The playable base game now includes the 30-hex 5–6 player extension and paired turns,
+single lobby, browser renderer, player trading/chat, durable checkpoints and CTN import/export,
+scenario workshop, host controls, built-in bots, and integrated local-model adapters.
+See [the hosting guide](./README.md) and [LLM setup](./docs/LLM.md).
+Rule and multiplayer tests include complete games at every supported player count.
+Further content expansions and visual polish remain later work. Real model throughput
+depends on the host's installed model/hardware; adapters are tested with mocked services.
+
 A host runs one Python server on their computer with exactly one lobby and at most one active game. Friends open its public URL, claim their own seats, and play a complete six-player-capable base game. Human and local-LLM players use the same rules engine. The browser draws the board and animations; the server alone decides whether actions are legal, updates state, and persists the game. An optional invite code controls entry to this single lobby; it is never a room selector.
 
 The first release includes base Catan and its 5–6 player extension, public and private chat, save/export/import, reconnect and pause behavior, an isolated visual testing page at `/testing`, and an owner-only control page at `/secret`. Later releases add named expansion rule packs and configurable house rules.

@@ -5,10 +5,24 @@
       "label": "Build frontend",
       "type": "shell",
       "command": "npm",
-      "args": ["run", "build"],
+      "args": [
+        "run",
+        "build"
+      ],
       "isBackground": false,
       "problemMatcher": [],
       "group": "build"
+    },
+    {
+      "label": "Host Catan",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "-m",
+        "catan_server"
+      ],
+      "isBackground": true,
+      "problemMatcher": []
     }
   ]
 }

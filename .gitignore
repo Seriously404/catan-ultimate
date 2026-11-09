@@ -18,6 +18,7 @@ frontend/dist/
 !.env.example
 data/
 *.ctn
+catan-seat*.json
 
 # Operating-system files
 .DS_Store
