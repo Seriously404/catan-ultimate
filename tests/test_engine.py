@@ -14,7 +14,9 @@ from catan_server.scenarios import decode_save, encode_save, validate_game
 
 
 def game(n=3, setup=True):
-    g = e.new_game([f"p{i}" for i in range(n)], "test-island", deck_rng=random.Random("deck"))
+    g = e.new_game(
+        [f"p{i}" for i in range(n)], "test-island", deck_rng=random.Random("deck"), opening=False
+    )
     return e.quick_setup(g) if setup else g
 
 
@@ -262,6 +264,12 @@ def test_ports_and_atomic_player_trade():
     g = e.apply(g, a, {"type": "bank_trade", "give": "wood", "receive": "wheat"})
     g = e.apply(g, a, {"type": "offer_trade", "to": b, "give": {"wood": 1}, "want": {"ore": 1}})
     g = e.apply(g, b, {"type": "accept_trade", "offer": g["offers"][0]["id"]})
+    g = e.apply(
+        g,
+        a,
+        {"type": "settle_trade", "offer": g["offers"][0]["id"]},
+        now=g["offers"][0]["closes_at"],
+    )
     assert g["players"][a]["resources"]["ore"] == 1
     assert g["players"][b]["resources"]["wood"] == 1
     with pytest.raises(e.RuleError):
@@ -294,7 +302,7 @@ def test_hidden_victory_points_and_secondary_turn_win():
     # A configurable scenario target of 3: two starting settlements + a hidden point.
     g["target"] = 3
     card(g, secondary, "victory_point")
-    assert e.player_view(g, g["active"])["players"][secondary]["points"] == 2
+    assert "points" not in e.player_view(g, g["active"])["players"][secondary]
     e.rescore(g)
     assert g["winner"] is None
     g = e.apply(g, g["active"], {"type": "end_turn"})

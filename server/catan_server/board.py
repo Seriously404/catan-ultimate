@@ -86,8 +86,14 @@ def make_board(expanded: bool, rng: random.Random) -> dict:
         ordered.append(eid)
         e = edges[eid]
         current = e["b"] if e["a"] == current else e["a"]
-    ports = list(RESOURCES) + ["any"] * 4 + (["any", "wool"] if expanded else [])
-    rng.shuffle(ports)
+    specialized = list(RESOURCES) + (["wool"] if expanded else [])
+    rng.shuffle(specialized)
+    # Odd port counts imply one specialized/specialized seam; otherwise alternate rates.
+    ports = [
+        value
+        for i, resource in enumerate(specialized)
+        for value in ([resource, "any"] if i < len(specialized) - 1 else [resource])
+    ]
     for i, port in enumerate(ports):
         edges[ordered[i * len(ordered) // len(ports)]]["port"] = port
     return {"tiles": tiles, "vertices": vertices, "edges": edges}

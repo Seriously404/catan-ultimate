@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 
 from catan_server import botlogic, engine
@@ -27,6 +28,9 @@ async def probe(config: dict, players: int = 6) -> dict:
         "players": [{"id": p, "name": p} for p in game["order"]],
     }
     started = time.monotonic()
+    await botlogic.ask_model(config, observation, actions, [], warmup=True)
+    warmup_seconds = round(time.monotonic() - started, 2)
+    started = time.monotonic()
     result = await botlogic.ask_model(config, observation, actions, [])
     choice = result.get("choice")
     command = result.get("command")
@@ -38,9 +42,13 @@ async def probe(config: dict, players: int = 6) -> dict:
     engine.apply(game, actor, command)
     return {
         "ok": True,
+        "warmup": {"status": "active", "seconds": warmup_seconds},
         "seconds": round(time.monotonic() - started, 2),
         "command": command,
         "message": str(result.get("message", ""))[:500],
+        "messages": result.get("messages", [])[:3]
+        if isinstance(result.get("messages"), list)
+        else [],
     }
 
 
@@ -56,6 +64,11 @@ def main() -> None:
     args = parser.parse_args()
     try:
         config = bot_config({**vars(args), "api_key": os.getenv("CATAN_MODEL_API_KEY", "")})
+        print(
+            "Warming full harness/game context; waiting for active (no timeout)...",
+            file=sys.stderr,
+            flush=True,
+        )
         print(json.dumps(asyncio.run(probe(config, args.players)), indent=2))
     except Exception as exc:
         print(

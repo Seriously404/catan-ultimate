@@ -3,6 +3,7 @@
 import copy
 import itertools
 import random
+import time
 from collections import Counter
 
 from catan_server.board import RESOURCES, make_board
@@ -15,6 +16,7 @@ COSTS = {
 }
 DEVELOPMENTS = ("knight", "road_building", "year_of_plenty", "monopoly", "victory_point")
 PHASES = {
+    "opening_roll",
     "setup_settlement",
     "setup_road",
     "roll",
@@ -50,15 +52,19 @@ def resource_bundle(value: dict) -> dict:
 
 
 def new_game(
-    ids: list[str], seed: str = "", target: int = 10, *, deck_rng: random.Random | None = None
+    ids: list[str],
+    seed: str = "",
+    target: int = 10,
+    *,
+    deck_rng: random.Random | None = None,
+    opening: bool = True,
 ) -> dict:
     require(3 <= len(ids) <= 6 and len(set(ids)) == len(ids), "A game needs 3–6 unique seats")
     require(type(target) is int and 3 <= target <= 30, "Victory target must be 3–30")
     rng = random.Random(seed)
     expanded = len(ids) > 4
     board = make_board(expanded, rng)
-    first = rng.randrange(len(ids))
-    order = ids[first:] + ids[:first]
+    order = ids.copy()
     deck = [
         card
         for card, count in zip(
@@ -77,11 +83,14 @@ def new_game(
         "target": target,
         "board": board,
         "order": order,
-        "players": {p: {"resources": empty_hand(), "dev": [], "knights": 0} for p in ids},
+        "players": {
+            p: {"resources": empty_hand(), "dev": [], "knights": 0, "played": []} for p in ids
+        },
         "bank": dict.fromkeys(RESOURCES, 24 if expanded else 19),
         "deck": deck,
         "played_cards": [],
-        "phase": "setup_settlement",
+        "phase": "opening_roll" if opening else "setup_settlement",
+        "opening": {"round": 1, "pending": ids.copy(), "rolls": {}, "history": []},
         "active": order[0],
         "primary": 0,
         "secondary": False,
@@ -93,6 +102,7 @@ def new_game(
         "free_roads": 0,
         "discards": {},
         "victims": [],
+        "steal_target": None,
         "dice": [],
         "robber": next(t for t, v in board["tiles"].items() if v["resource"] == "desert"),
         "longest_road": None,
@@ -223,9 +233,10 @@ def rescore(g: dict) -> None:
     g["largest_army"] = award(
         {p: g["players"][p]["knights"] for p in g["order"]}, g["largest_army"], 3
     )
-    if g["phase"] not in ("setup_settlement", "setup_road", "finished"):
+    if g["phase"] not in ("opening_roll", "setup_settlement", "setup_road", "finished"):
         if points(g, g["active"], True) >= g["target"]:
             g["winner"], g["phase"] = g["active"], "finished"
+            g["offers"] = []
 
 
 def can_pay(g: dict, pid: str, cost: dict) -> bool:
@@ -262,10 +273,12 @@ def produce(g: dict, number: int) -> None:
             give(g, next(iter(players)), {r: g["bank"][r]})
 
 
-def legal_actions(g: dict | None, pid: str | None) -> list[dict]:
+def legal_actions(g: dict | None, pid: str | None, *, now: float | None = None) -> list[dict]:
     if not g or pid not in g["players"] or g["winner"]:
         return []
     phase = g["phase"]
+    if phase == "opening_roll":
+        return [{"type": "opening_roll"}] if pid == g["active"] else []
     if phase == "discard" and pid in g["discards"]:
         # One suggested bundle; arbitrary bundles of the required size are also accepted.
         hand = g["players"][pid]["resources"].copy()
@@ -278,14 +291,7 @@ def legal_actions(g: dict | None, pid: str | None) -> list[dict]:
     if pid != g["active"]:
         if phase != "action" or g["secondary"]:
             return []
-        return [
-            {"type": "accept_trade", "offer": o["id"]}
-            for o in g["offers"]
-            if (not o["to"] or o["to"] == pid)
-            and o["from"] != pid
-            and can_pay(g, pid, o["want"])
-            and can_pay(g, o["from"], o["give"])
-        ]
+        return trade_actions(g, pid, now) + suggested_trades(g, pid)
     if phase == "setup_settlement":
         return [{"type": "build_settlement", "vertex": v} for v in settlement_sites(g, pid, True)]
     if phase == "setup_road":
@@ -293,12 +299,16 @@ def legal_actions(g: dict | None, pid: str | None) -> list[dict]:
     if phase == "robber":
         return [{"type": "move_robber", "tile": t} for t in g["board"]["tiles"] if t != g["robber"]]
     if phase == "steal":
-        return [{"type": "steal", "victim": p} for p in g["victims"]]
+        if g.get("steal_target"):
+            return [{"type": "steal", "victim": g["steal_target"]}]
+        return [{"type": "inspect_steal", "victim": p} for p in g["victims"]]
     if phase == "free_roads":
         return [{"type": "build_road", "edge": e} for e in road_sites(g, pid)]
     if phase not in ("roll", "action"):
         return []
-    result = [{"type": "roll"}] if phase == "roll" else [{"type": "end_turn"}]
+    result = (
+        [{"type": "roll"}] if phase == "roll" else ([] if g["offers"] else [{"type": "end_turn"}])
+    )
     if not g["dev_played"]:
         usable = {c["type"] for c in g["players"][pid]["dev"] if c["bought"] < g["turn"]}
         for card in usable - {"victory_point"}:
@@ -311,6 +321,8 @@ def legal_actions(g: dict | None, pid: str | None) -> list[dict]:
                     if all(g["bank"][r] >= n for r, n in bundle.items()):
                         result.append({"type": "play_dev", "card": card, "resources": bundle})
             elif card != "road_building" or road_sites(g, pid):
+                if g["offers"] and card in ("knight", "road_building"):
+                    continue
                 result.append({"type": "play_dev", "card": card})
     if phase == "roll":
         return result
@@ -341,18 +353,14 @@ def legal_actions(g: dict | None, pid: str | None) -> list[dict]:
                 for s in RESOURCES
                 if s != r and g["bank"][s]
             ]
-    result += [
-        {"type": "accept_trade", "offer": o["id"]}
-        for o in g["offers"]
-        if o["to"] == pid
-        and o["from"] != pid
-        and can_pay(g, pid, o["want"])
-        and can_pay(g, o["from"], o["give"])
-    ]
+    if not g["secondary"]:
+        result += trade_actions(g, pid, now) + suggested_trades(g, pid)
     return result
 
 
-def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) -> dict:
+def apply(
+    g: dict, pid: str, command: dict, rng: random.Random | None = None, *, now: float | None = None
+) -> dict:
     require(isinstance(command, dict), "Command must be an object")
     require(pid in g["players"], "Unknown player")
     require(not g["winner"], "The game is over")
@@ -362,11 +370,43 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
     phase = g["phase"]
     event = {"type": str(kind), "actor": pid, "text": str(kind).replace("_", " ")}
     g["last_event"] = event
-    if kind in ("offer_trade", "accept_trade", "cancel_trade"):
-        _trade(g, pid, command)
+    if kind in (
+        "offer_trade",
+        "accept_trade",
+        "reject_trade",
+        "select_trade",
+        "cancel_trade",
+        "settle_trade",
+    ):
+        _trade(g, pid, command, time.time() if now is None else now)
         return g
     require(kind == "discard" or pid == g["active"], "It is not your turn")
-    if kind == "discard":
+    if kind == "opening_roll":
+        require(phase == "opening_roll", "Opening rolls have already finished")
+        dice = (
+            g["rigged_dice"].pop(0) if g["rigged_dice"] else [rng.randint(1, 6), rng.randint(1, 6)]
+        )
+        g["dice"] = dice
+        opening = g["opening"]
+        opening["rolls"][pid] = sum(dice)
+        opening["history"].append({"round": opening["round"], "player": pid, "dice": dice.copy()})
+        opening["pending"].remove(pid)
+        event.update(dice=dice.copy(), text=f"rolled {sum(dice)} for first player")
+        if not opening["pending"]:
+            highest = max(opening["rolls"].values())
+            leaders = [p for p in g["order"] if opening["rolls"].get(p) == highest]
+            if len(leaders) == 1:
+                first = g["order"].index(leaders[0])
+                g["order"] = g["order"][first:] + g["order"][:first]
+                g["active"], g["phase"] = leaders[0], "setup_settlement"
+                event["first_player"] = leaders[0]
+            else:
+                opening.update(round=opening["round"] + 1, rolls={}, pending=leaders)
+                g["active"] = leaders[0]
+                event["text"] += "; highest players reroll the tie"
+        else:
+            g["active"] = opening["pending"][0]
+    elif kind == "discard":
         require(phase == "discard" and pid in g["discards"], "No discard is required")
         bundle = resource_bundle(command.get("resources"))
         require(sum(bundle.values()) == g["discards"][pid], "Discard exactly half, rounded down")
@@ -449,6 +489,7 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
         tile = command.get("tile")
         require(tile in g["board"]["tiles"] and tile != g["robber"], "Choose a different land hex")
         g["robber"] = tile
+        g["steal_target"] = None
         event["tile"] = tile
         g["victims"] = sorted(
             {
@@ -460,6 +501,11 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
             }
         )
         g["phase"] = "steal" if g["victims"] else g["return_phase"]
+    elif kind == "inspect_steal":
+        victim = command.get("victim")
+        require(phase == "steal" and victim in g["victims"], "Choose an eligible victim")
+        g["steal_target"] = victim
+        event.update(victim=victim, text="is choosing a face-down card")
     elif kind == "steal":
         victim = command.get("victim")
         require(phase == "steal" and victim in g["victims"], "Choose an eligible victim")
@@ -469,6 +515,7 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
         g["players"][pid]["resources"][resource] += 1
         event.update({"victim": victim, "resource": resource, "text": "stole a card"})
         g["phase"], g["victims"] = g["return_phase"], []
+        g["steal_target"] = None
     elif kind == "bank_trade":
         require(phase == "action", "Trade during the action phase")
         r, s = command.get("give"), command.get("receive")
@@ -489,6 +536,10 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
         )
         card = command.get("card")
         require(
+            not g["offers"] or card not in ("knight", "road_building"),
+            "Resolve or cancel trades before entering a different phase",
+        )
+        require(
             card in DEVELOPMENTS and card != "victory_point", "Victory points count automatically"
         )
         cards = g["players"][pid]["dev"]
@@ -498,8 +549,10 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
         require(index is not None, "You cannot play a card bought during this turn")
         cards.pop(index)
         g["played_cards"].append(card)
+        g["players"][pid].setdefault("played", []).append(card)
         g["dev_played"] = True
         event["text"] = f"played {card.replace('_', ' ')}"
+        event["card"] = card
         if card == "knight":
             g["players"][pid]["knights"] += 1
             g["return_phase"], g["phase"] = phase, "robber"
@@ -523,6 +576,7 @@ def apply(g: dict, pid: str, command: dict, rng: random.Random | None = None) ->
                     data["resources"][r] = 0
     elif kind == "end_turn":
         require(phase == "action", "Resolve the current phase before ending the turn")
+        require(not g["offers"], "Resolve or cancel outstanding trades before ending the turn")
         _next_turn(g)
     else:
         raise RuleError("Unknown command")
@@ -542,23 +596,129 @@ def _next_turn(g: dict) -> None:
         g["active"], g["phase"] = g["order"][g["primary"]], "roll"
 
 
-def _trade(g: dict, pid: str, c: dict) -> None:
+def offer_recipients(g: dict, offer: dict) -> list[str]:
+    targets = offer.get("to") or []
+    if isinstance(targets, str):
+        targets = [targets]
+    return [
+        p
+        for p in g["order"]
+        if p != offer["from"]
+        and (not targets or p in targets)
+        and g["active"] in (p, offer["from"])
+    ]
+
+
+def trade_actions(g: dict, pid: str, now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    actions = []
+    for o in g["offers"]:
+        responses = o.get("responses", {})
+        if pid == o["from"]:
+            if now >= o.get("closes_at", 0):
+                actions.append({"type": "cancel_trade", "offer": o["id"]})
+                accepted = [
+                    p
+                    for p, answer in responses.items()
+                    if answer == "accepted" and can_pay(g, p, o["want"])
+                ]
+                if len(accepted) > 1:
+                    actions += [
+                        {"type": "select_trade", "offer": o["id"], "player": p} for p in accepted
+                    ]
+        elif pid in offer_recipients(g, o) and responses.get(pid, "pending") == "pending":
+            if o.get("selecting"):
+                continue
+            actions.append({"type": "reject_trade", "offer": o["id"]})
+            if can_pay(g, pid, o["want"]) and can_pay(g, o["from"], o["give"]):
+                actions.append({"type": "accept_trade", "offer": o["id"]})
+    return actions
+
+
+def suggested_trades(g: dict, pid: str) -> list[dict]:
+    if any(o["from"] == pid for o in g["offers"]):
+        return []
+    hand = g["players"][pid]["resources"]
+    return [
+        {
+            "type": "offer_trade",
+            "to": [] if pid == g["active"] else [g["active"]],
+            "give": {r: 1},
+            "want": {s: 1},
+        }
+        for r in RESOURCES
+        if hand[r] > 1
+        for s in RESOURCES
+        if s != r and hand[s] == 0
+    ]
+
+
+def _exchange(g: dict, offer: dict, partner: str) -> None:
+    require(
+        can_pay(g, partner, offer["want"]) and can_pay(g, offer["from"], offer["give"]),
+        "Resources changed; offer can no longer be accepted",
+    )
+    for r in RESOURCES:
+        delta = offer["give"][r] - offer["want"][r]
+        g["players"][partner]["resources"][r] += delta
+        g["players"][offer["from"]]["resources"][r] -= delta
+    g["offers"].remove(offer)
+    g["last_event"].update(
+        type="trade_completed",
+        proposer=offer["from"],
+        partner=partner,
+        give=offer["give"],
+        want=offer["want"],
+        text="completed a player trade",
+    )
+
+
+def _resolve_offer(g: dict, offer: dict, now: float) -> None:
+    responses = offer["responses"]
+    for p, answer in responses.items():
+        if answer == "accepted" and not can_pay(g, p, offer["want"]):
+            responses[p] = "rejected"
+    if not can_pay(g, offer["from"], offer["give"]) or all(
+        v == "rejected" for v in responses.values()
+    ):
+        g["offers"].remove(offer)
+        g["last_event"].update(type="trade_failed", text="trade closed: rejected or unaffordable")
+        return
+    if now < offer["closes_at"]:
+        return
+    offer["window_closed"] = True
+    accepted = [p for p, answer in responses.items() if answer == "accepted"]
+    if len(accepted) == 1:
+        _exchange(g, offer, accepted[0])
+    elif len(accepted) > 1:
+        offer["selecting"] = True
+        g["last_event"].update(type="trade_selection", text="proposer must choose a trade partner")
+    else:
+        g["last_event"].update(type="trade_open", text="trade open for the first acceptance")
+
+
+def _trade(g: dict, pid: str, c: dict, now: float) -> None:
     require(
         g["phase"] == "action" and not g["secondary"],
         "Player trades are only allowed in player 1's action phase",
     )
     if c["type"] == "offer_trade":
-        target = c.get("to") or None
+        targets = c.get("to") or []
+        if isinstance(targets, str):
+            targets = [targets]
         require(
-            target is None or target in g["players"] and target != pid, "Choose a different player"
+            isinstance(targets, list)
+            and all(isinstance(p, str) and p in g["players"] and p != pid for p in targets),
+            "Choose different valid players",
         )
         require(
-            pid == g["active"] or target == g["active"], "Trades must involve the active player"
+            pid == g["active"] or targets == [g["active"]], "Trades must involve the active player"
         )
         give_bundle, want = resource_bundle(c.get("give")), resource_bundle(c.get("want"))
         require(
-            sum(give_bundle.values()) > 0 and sum(want.values()) > 0,
-            "Both sides must give resources",
+            sum(give_bundle.values()) + sum(want.values()) > 0
+            and (bool(targets) or sum(give_bundle.values()) > 0 and sum(want.values()) > 0),
+            "Choose specific recipients for a gift; public offers must exchange resources",
         )
         require(
             not any(give_bundle[r] and want[r] for r in RESOURCES),
@@ -566,63 +726,151 @@ def _trade(g: dict, pid: str, c: dict) -> None:
         )
         require(can_pay(g, pid, give_bundle), "You cannot offer cards you do not own")
         require(len(g["offers"]) < 20, "Cancel an existing offer first")
-        g["offers"].append(
-            {"id": g["next_offer"], "from": pid, "to": target, "give": give_bundle, "want": want}
-        )
+        offer = {
+            "id": g["next_offer"],
+            "from": pid,
+            "to": sorted(set(targets)),
+            "give": give_bundle,
+            "want": want,
+            "created_at": now,
+            "closes_at": now + 5,
+            "responses": {},
+            "window_closed": False,
+            "selecting": False,
+        }
+        offer["responses"] = dict.fromkeys(offer_recipients(g, offer), "pending")
+        g["offers"].append(offer)
         g["next_offer"] += 1
     else:
         offer = next((o for o in g["offers"] if o["id"] == c.get("offer")), None)
         require(offer is not None, "Offer has expired")
+        g["last_event"].update(offer=offer["id"])
         if c["type"] == "cancel_trade":
             require(
                 pid in (offer["from"], g["active"]), "Only the proposer or active player can cancel"
             )
+            require(now >= offer["closes_at"], "Give players the full five-second response window")
+            g["offers"].remove(offer)
+        elif c["type"] == "settle_trade":
+            require(pid == offer["from"], "Only the proposer can settle an offer")
+            _resolve_offer(g, offer, now)
+        elif c["type"] == "select_trade":
+            require(
+                pid == offer["from"] and now >= offer["closes_at"],
+                "Only the proposer may select after five seconds",
+            )
+            require(
+                offer["responses"].get(c.get("player")) == "accepted", "Choose an accepting player"
+            )
+            _exchange(g, offer, c["player"])
         else:
             require(
-                pid != offer["from"] and (not offer["to"] or offer["to"] == pid),
+                pid in offer_recipients(g, offer),
                 "Offer is not addressed to you",
             )
-            require(g["active"] in (pid, offer["from"]), "Trade must involve the active player")
+            require(offer["responses"].get(pid) == "pending", "You have already responded")
             require(
-                can_pay(g, pid, offer["want"]) and can_pay(g, offer["from"], offer["give"]),
-                "Resources changed; offer can no longer be accepted",
+                not offer.get("selecting"), "The proposer is choosing among existing acceptances"
             )
-            for r in RESOURCES:
-                delta = offer["give"][r] - offer["want"][r]
-                g["players"][pid]["resources"][r] += delta
-                g["players"][offer["from"]]["resources"][r] -= delta
-        g["offers"].remove(offer)
+            if now >= offer["closes_at"] and not offer["window_closed"]:
+                _resolve_offer(g, offer, now)
+                require(
+                    offer in g["offers"] and not offer.get("selecting"),
+                    "Offer already has an accepted partner",
+                )
+            if c["type"] == "accept_trade":
+                require(
+                    can_pay(g, pid, offer["want"]) and can_pay(g, offer["from"], offer["give"]),
+                    "Resources changed; offer can no longer be accepted",
+                )
+            offer["responses"][pid] = "accepted" if c["type"] == "accept_trade" else "rejected"
+            g["last_event"]["response"] = offer["responses"][pid]
+            _resolve_offer(g, offer, now)
+    g["last_event"].update(
+        offer=offer["id"], audience=[offer["from"], *offer["responses"]] if offer["to"] else []
+    )
 
 
-def player_view(g: dict, pid: str | None) -> dict:
+def next_roller(g: dict) -> str:
+    if g["phase"] == "opening_roll" or g["phase"] == "roll":
+        return g["active"]
+    if g["phase"].startswith("setup"):
+        return g["order"][0]
+    return g["order"][(g["primary"] + 1) % len(g["order"])]
+
+
+def visible_event(event: dict, pid: str | None) -> dict | None:
+    if event.get("audience") and pid not in event["audience"]:
+        if event.get("type") != "trade_completed":
+            return None
+        event = copy.deepcopy(event)
+        event.pop("give", None)
+        event.pop("want", None)
+        event.pop("audience", None)
+    event = copy.deepcopy(event)
+    if event.get("type") == "steal" and pid not in (event.get("actor"), event.get("victim")):
+        event.pop("resource", None)
+    for effect in event.get("effects", []):
+        public_payment = event.get("type") in {
+            "build_road",
+            "build_settlement",
+            "build_city",
+            "buy_dev",
+            "bank_trade",
+            "roll",
+            "play_dev",
+        }
+        participant = event.get("type") == "trade_completed" and pid in (
+            event.get("proposer"),
+            event.get("partner"),
+        )
+        if (
+            effect.get("player") != pid
+            and not public_payment
+            and not participant
+            and not (
+                event.get("type") == "steal" and pid in (event.get("actor"), event.get("victim"))
+            )
+        ):
+            effect.pop("resources", None)
+    return event
+
+
+def player_view(g: dict, pid: str | None, *, now: float | None = None) -> dict:
     view = copy.deepcopy(g)
     view["deck_count"] = len(view.pop("deck"))
     view.pop("rigged_dice", None)
     for p, data in view["players"].items():
         data["resource_count"] = sum(data["resources"].values())
         data["dev_count"] = len(data["dev"])
-        data["points"] = points(g, p, p == pid)
+        data.pop("points", None)
         data["pieces"] = pieces(g, p)
         if p != pid and not g["winner"]:
             data.pop("resources")
             data.pop("dev")
-    event = view["last_event"]
-    if event.get("type") == "steal" and pid not in (event.get("actor"), event.get("victim")):
-        event.pop("resource", None)
-    view["offers"] = [o for o in view["offers"] if not o["to"] or pid in (o["from"], o["to"])]
-    view["legal"] = legal_actions(g, pid)
+    view["last_event"] = visible_event(view["last_event"], pid) or {
+        "type": "private_action",
+        "text": "",
+    }
+    view["offers"] = [
+        o
+        for o in view["offers"]
+        if not o["to"] or pid == o["from"] or pid in offer_recipients(g, o)
+    ]
+    view["legal"] = legal_actions(g, pid, now=now)
     view["ratios"] = trade_ratios(g, pid) if pid in g["players"] else {}
     return view
 
 
 def quick_setup(g: dict) -> dict:
     """Legal automatic setup for scenarios, tests, and impatient hosts."""
-    while g["phase"].startswith("setup"):
+    opening_rng = random.Random(g["seed"] + ":opening")
+    while g["phase"] == "opening_roll" or g["phase"].startswith("setup"):
         options = legal_actions(g, g["active"])
         require(bool(options), "No starting placement is possible")
         if g["phase"] == "setup_settlement":
             options.sort(key=lambda a: vertex_value(g, a["vertex"]), reverse=True)
-        g = apply(g, g["active"], options[0])
+        g = apply(g, g["active"], options[0], opening_rng)
     return g
 
 

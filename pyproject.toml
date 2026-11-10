@@ -11,11 +11,11 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162,<1",
     "uvicorn[standard]>=0.54,<1",
+    "httpx2>=2.16,<3",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx2>=2.16,<3",
     "pytest>=9.2,<10",
     "ruff>=0.17.4,<1",
 ]

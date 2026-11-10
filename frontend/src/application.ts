@@ -1,4 +1,6 @@
 import { BoardRenderer } from "./board";
+import { TableScene } from "./table-scene";
+import { cards } from "./cards";
 import { escape as h, label, resources } from "./types";
 import { fields, shell } from "./ui";
 import type { Action, Bundle, Event, Game, State } from "./types";
@@ -26,6 +28,8 @@ class Application {
   private hostKey = sessionStorage.getItem("catan.host") ?? "";
   private ws: WebSocket | null = null;
   private renderer: BoardRenderer;
+  private scene: TableScene;
+  private offersHTML = "";
   private mode = "";
   private lastEvent = -1;
   private page = location.pathname === "/testing" ? "testing" : location.pathname === "/secret" ? "admin" : "play";
@@ -33,9 +37,14 @@ class Application {
   private actor = "";
   private editTarget = "vertex";
   private errorTimer = 0;
+  private clockOffset = 0;
+  private animationChain: Promise<void> = Promise.resolve();
+  private animationGeneration = 0;
 
   constructor() {
     this.renderer = new BoardRenderer($("#board"));
+    this.scene = new TableScene(this.renderer);
+    this.scene.onSteal = (victim, index) => { void this.move({type: "steal", victim, card_index: index}).catch(e => {this.error(e); this.scene.relayout();}); };
     this.renderer.onSelect = (id, action) => {
       if (this.page === "testing" && action) {
         void this.move(action).catch(e => this.error(e));
@@ -58,6 +67,13 @@ class Application {
       if (input.id === "import-save" || input.id === "import-scenario") void this.file(input).catch(e => this.error(e));
     });
     addEventListener("resize", () => this.renderOpponents());
+    setInterval(() => {
+      this.renderOffers();
+      const busy = this.page === "play" && this.serverNow() < (this.state?.presentation_until ?? 0);
+      document.querySelectorAll<HTMLButtonElement>("#actions button").forEach(button => {
+        button.disabled = busy && button.dataset.do !== "trade";
+      });
+    }, 200);
     $("#modal-close").addEventListener("click", () => this.closeDialog());
     if (this.page !== "play") {
       $("#tools").hidden = false;
@@ -90,11 +106,20 @@ class Application {
   }
   private receive(state: State): void {
     if (this.state && state.revision < this.state.revision) return;
-    if (state.game_id !== this.state?.game_id) { this.lastEvent = state.revision; this.mode = ""; this.actor = ""; }
+    if (state.game_id !== this.state?.game_id) { this.lastEvent = state.revision; this.mode = ""; this.actor = ""; this.animationGeneration++; this.scene.reset(); }
     if (state.game?.phase !== this.state?.game?.phase || state.game?.active !== this.state?.game?.active) this.mode = "";
+    const events = state.events.filter(e => e.id > this.lastEvent);
+    this.scene.reserve(events);
     this.state = state;
+    this.clockOffset = Date.now() / 1000 - state.server_time;
     this.renderLobby(); this.renderGame(); this.renderChat(); this.renderTools();
-    if (this.lastEvent >= 0) for (const event of state.events.filter(e => e.id > this.lastEvent)) this.animate(event);
+    if (this.lastEvent >= 0) for (const event of events) {
+      const generation = this.animationGeneration;
+      this.animationChain = this.animationChain.then(async () => {
+        if (generation !== this.animationGeneration) return;
+        await this.animate(event);
+      }).catch(error => console.error("Animation failed", error));
+    }
     this.lastEvent = Math.max(this.lastEvent, ...state.events.map(e => e.id));
   }
   private game(): Game | null {
@@ -109,7 +134,7 @@ class Application {
     if (this.page === "testing") { await this.host({type: "test_command", player: this.actor || this.game()?.active, command}); return; }
     if (this.state?.paused && !["chat", "save", "end_session"].includes(command.type)) { this.error("Game paused. Reconnect all human seats or resume from host controls."); return; }
     const id = crypto.randomUUID?.() ?? Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
-    try { await this.api("command", {command, id, revision: ["chat", "ready", "save", "end_session"].includes(command.type) ? null : this.state?.revision}); this.closeDialog(); }
+    try { await this.api("command", {command, id, revision: ["chat", "ready", "save", "end_session", "offer_trade", "accept_trade", "reject_trade", "select_trade", "cancel_trade"].includes(command.type) ? null : this.state?.revision}); this.closeDialog(); }
     catch (error) { void this.refresh(); throw error; }
   }
   private async host(command: Action): Promise<Record<string, unknown>> { const result = await this.api("host", command); await this.refresh(); return result; }
@@ -140,39 +165,48 @@ class Application {
     const s = this.state, g = this.game(); if (!s) return;
     const actions = this.actions();
     if (!this.mode) this.mode = ({setup_settlement: "build_settlement", setup_road: "build_road", free_roads: "build_road", robber: "move_robber"} as Record<string, string>)[g?.phase ?? ""] ?? "";
+    const viewer = this.page === "testing" ? this.actor || g?.active || null : s.me;
+    const physical = s.players.filter(p => g?.order.includes(p.id));
+    this.renderer.setRotation(-Math.max(0, physical.findIndex(p => p.id === viewer)) * Math.PI * 2 / Math.max(1, physical.length));
     this.renderer.set(g, s.players, actions, this.mode, this.page === "play" ? "" : this.editTarget);
-    $("#round-info").innerHTML = g ? `<span class="eyebrow">${g.expanded ? "5–6 · 30 HEXES · PAIRED TURNS" : "BASE GAME · 19 HEXES"}${g.modified ? " · MODIFIED" : ""}</span><h2>${g.winner ? `${h(this.name(g.winner))} wins!` : `${h(this.name(g.active))}${g.secondary ? " · Player 2" : ""}`}</h2><span>${h(label(g.phase))} · target ${g.target} VP</span> <span class="dice">${g.dice.map(n => `[${n}]`).join(" ")}</span>` : "";
+    $("#round-info").innerHTML = g ? `<span class="eyebrow">${g.expanded ? "5–6 · 30 HEXES · PAIRED TURNS" : "BASE GAME · 19 HEXES"}${g.modified ? " · MODIFIED" : ""}</span><h2>${g.winner ? `${h(this.name(g.winner))} wins!` : `${h(this.name(g.active))}${g.secondary ? " · Player 2" : ""}`}</h2><span>${h(label(g.phase))} · target ${g.target} VP</span>${g.phase === "opening_roll" ? `<p class="opening-summary">Opening round ${g.opening?.round ?? 1} · highest roll starts<br>${Object.entries(g.opening?.rolls ?? {}).map(([pid,n]) => `${h(this.name(pid))}: ${n}`).join(" · ")}</p>` : ""}` : "";
     $("#pause").hidden = !s.paused || !s.game || this.page === "testing";
     $("#pause").innerHTML = `<b>Game paused and saved</b><span>${s.players.filter(p => !p.online).map(p => h(p.name)).join(", ") || "The host paused the table"}</span><button data-do="save-checkpoint">Save checkpoint</button><button data-do="end-vote">Vote to end session</button>${s.owner ? '<button data-do="resume">Resume</button>' : ""}`;
     const has = (kind: string) => actions.some(a => a.type === kind); let buttons = "";
     if (g && (s.me || this.page === "testing")) {
+      if (has("opening_roll")) buttons += '<button data-do="opening-roll" class="primary">Roll for first player</button>';
       if (has("roll")) buttons += '<button data-do="roll" class="primary">Roll dice</button>';
       for (const [kind, text] of [["build_road", "Road"], ["build_settlement", "Settlement"], ["build_city", "City"], ["move_robber", "Move robber"]]) if (has(kind!)) buttons += `<button data-do="mode" data-mode="${kind}" class="${this.mode === kind ? "selected" : ""}">${text}</button>`;
       if (has("buy_dev")) buttons += '<button data-do="buy-dev">Buy development</button>';
       if (has("bank_trade")) buttons += '<button data-do="bank">Bank / ports</button>';
       if (g.phase === "action" && !g.secondary && this.page === "play") buttons += '<button data-do="trade">Offer trade</button>';
       if (has("discard")) buttons += `<button data-do="discard" class="danger">Discard ${g.discards[s.me!] ?? "cards"}</button>`;
-      for (const a of actions.filter(a => a.type === "steal")) buttons += `<button data-do="steal" data-player="${h(a.victim)}">Steal from ${h(this.name(String(a.victim)))}</button>`;
+      for (const a of actions.filter(a => a.type === "inspect_steal")) buttons += `<button data-do="choose-victim" data-player="${h(a.victim)}">Steal from ${h(this.name(String(a.victim)))}</button>`;
       if (has("end_turn")) buttons += '<button data-do="end-turn" class="primary">End turn</button>';
     }
     $("#actions").innerHTML = buttons;
     $("#hint").textContent = g ? this.mode && actions.some(a => a.type === this.mode) ? `Choose a highlighted ${this.mode === "build_road" ? "edge" : this.mode === "move_robber" ? "hex" : "intersection"}. Drag to pan · scroll / pinch to zoom.` : actions.length ? "Choose an action below. Drag to pan · scroll / pinch to zoom." : "Waiting for the other players. Drag to pan · scroll / pinch to zoom." : "";
-    const handPlayer = this.page === "testing" ? this.actor || g?.active : s.me;
-    const me = handPlayer ? g?.players[handPlayer] : undefined;
-    $("#hand").innerHTML = me?.resources ? `<div class="hand-cards">${resources.map(r => `<div class="card ${r}"><span>${r}</span><strong>${me.resources![r]}</strong></div>`).join("")}</div><div class="dev-cards">${Object.entries((me.dev ?? []).reduce<Record<string, number>>((a, c) => {a[c.type] = (a[c.type] ?? 0) + 1; return a;}, {})).map(([card, count]) => `<button data-do="dev" data-card="${card}" ${actions.some(a => a.card === card) ? "" : "disabled"}>${h(label(card))} ×${count}</button>`).join("")}</div><div class="hand-caption">${h(this.name(s.me))} · ${me.points ?? 0} VP · roads ${me.pieces?.road ?? 0}/15 · settlements ${me.pieces?.settlement ?? 0}/5 · cities ${me.pieces?.city ?? 0}/4</div>` : "";
-    $("#bank-stock").textContent = g ? `Bank: ${resources.map(r => `${r} ${g.bank[r]}`).join(" · ")} · Dev ${g.deck_count ?? "—"}` : "";
-    $("#offers").innerHTML = (g?.offers ?? []).map(o => `<div class="offer"><b>${h(this.name(o.from))}</b> offers ${h(bundleText(o.give))} for ${h(bundleText(o.want))}${actions.some(a => a.type === "accept_trade" && a.offer === o.id) ? `<button data-do="accept" data-offer="${o.id}">Accept</button>` : ""}${o.from === s.me ? `<button data-do="cancel-offer" data-offer="${o.id}">Cancel</button>` : ""}</div>`).join("");
-    this.renderOpponents();
+    $("#hand").innerHTML = "";
+    this.scene.sync(s,g,actions,viewer);
+    this.renderOffers();
   }
-  private renderOpponents(): void {
-    const s = this.state, g = this.game(); if (!s || !g || this.page !== "play") { $("#opponents").innerHTML = ""; return; }
-    const viewer = Math.max(0, g.order.indexOf(s.me ?? "")); const ids = [...g.order.slice(viewer + 1), ...g.order.slice(0, viewer)];
-    $("#opponents").innerHTML = ids.map((pid, i) => {
-      const angle = (150 + 240 * i / Math.max(1, ids.length - 1)) * Math.PI / 180;
-      const p = s.players.find(p => p.id === pid)!; const data = g.players[pid]!;
-      return `<div class="opponent ${g.active === pid ? "active" : ""}" data-seat="${h(pid)}" style="left:${51 + 39 * Math.cos(angle)}%;top:${44 + 32 * Math.sin(angle)}%;--seat:${p.color}"><b>${h(p.name)}</b><div class="card-backs"><span>▥ ${data.resource_count ?? 0}</span><span>✦ ${data.dev_count ?? 0}</span></div><small>${data.points ?? 0} VP · ${data.knights} ⚔${g.longest_road === pid ? " · Longest road" : ""}${g.largest_army === pid ? " · Largest army" : ""}</small><small>${p.thinking ? "Thinking…" : p.online ? "" : "Disconnected"}</small></div>`;
+  private serverNow(): number { return Date.now() / 1000 - this.clockOffset; }
+  private renderOffers(): void {
+    const actions=this.actions(), me=this.state?.me;
+    const html=(this.game()?.offers ?? []).map(o => {
+      const mine=o.from===me, pending=!!me && o.responses[me]==="pending";
+      const give=mine ? o.give : o.want, get=mine ? o.want : o.give;
+      const can=(type:string) => actions.some(a=>a.type===type && a.offer===o.id);
+      const responseButtons=pending && !o.selecting ? `<div class="offer-buttons"><button class="primary" data-do="accept" data-offer="${o.id}" ${can("accept_trade") ? "" : 'disabled title="Not enough resources"'}>Accept</button><button data-do="reject" data-offer="${o.id}">Reject</button></div>` : "";
+      const status=o.selecting ? "Choose a trading partner" : o.window_closed ? "Open · first acceptance wins" : `<span data-offer-clock="${o.closes_at}"></span>`;
+      const responses=Object.entries(o.responses).map(([pid,answer])=>`<li class="response-${answer}"><span>${h(this.name(pid))}</span><b>${answer === "accepted" ? "✓ Accepted" : answer === "rejected" ? "✕ Rejected" : "Waiting…"}</b>${actions.some(a=>a.type==="select_trade" && a.offer===o.id && a.player===pid) ? `<button data-do="select-partner" data-offer="${o.id}" data-player="${h(pid)}">Trade with ${h(this.name(pid))}</button>` : ""}</li>`).join("");
+      const pile=(bundle:Bundle) => cards(bundle) || '<em class="gift-note">Nothing · a gift</em>';
+      return `<article class="offer"><h3>${h(this.name(o.from))} offers:</h3><small>${h(o.to.length ? `Only: ${o.to.map(p=>this.name(p)).join(", ")}` : "Open to the table")}</small><div class="exchange-cards"><label>${me ? "You give" : "They request"}</label><div class="trade-card-row">${pile(give)}</div><span class="exchange-arrows" aria-label="in exchange for">⇅</span><label>${me ? "You get" : "They give"}</label><div class="trade-card-row">${pile(get)}</div></div>${responseButtons}<p class="offer-status">${status}</p><ul class="offer-responses">${responses}</ul>${can("cancel_trade") ? `<button class="quiet" data-do="cancel-offer" data-offer="${o.id}">Cancel offer</button>` : ""}</article>`;
     }).join("");
+    if(html!==this.offersHTML){$("#offers").innerHTML=html;this.offersHTML=html;}
+    document.querySelectorAll<HTMLElement>("[data-offer-clock]").forEach(el=>{const n=Math.max(0,Math.ceil(Number(el.dataset.offerClock)-this.serverNow()));el.textContent=n ? `Collecting responses · ${n}s` : "Checking responses…";});
   }
+  private renderOpponents(): void { this.scene.relayout(); }
   private renderChat(): void {
     const s = this.state; if (!s) return; const box = $("#messages"); const bottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
     box.innerHTML = s.chat.map(m => `<div class="message ${m.to.length ? "private" : ""}"><small>${h(this.name(m.from))}${m.to.length ? ` → ${m.to.map(p => h(this.name(p))).join(", ")} · private` : ""}</small><p>${h(m.text)}</p></div>`).join(""); if (bottom) box.scrollTop = box.scrollHeight;
@@ -196,16 +230,7 @@ class Application {
     if (botSelect.dataset.options !== bots) { botSelect.innerHTML = bots; botSelect.dataset.options = bots; }
     $("#bot-errors").textContent = Object.entries(s.bot_errors ?? {}).map(([p, error]) => `${this.name(p)}: ${error}`).join("\n");
   }
-  private animate(event: Event): void {
-    if (event.edge || event.vertex) this.renderer.animate(event); if (event.type !== "steal") return;
-    const table = $("#table").getBoundingClientRect();
-    const point = (pid?: string) => {
-      const element = pid === this.state?.me ? $("#hand") : document.querySelector(`[data-seat="${CSS.escape(pid ?? "")}"]`); const box = element?.getBoundingClientRect();
-      return {x: (box ? box.left + box.width / 2 : table.left + table.width / 2) - table.left, y: (box ? box.top + box.height / 2 : table.top + table.height / 2) - table.top};
-    };
-    const from = point(event.victim), to = point(event.actor); const card = document.createElement("div"); card.className = "flying-card"; card.textContent = event.resource ?? "▥"; $("#table").append(card);
-    card.animate([{transform: `translate(${from.x}px,${from.y}px) rotate(-15deg)`, opacity: 1}, {transform: `translate(${to.x}px,${to.y}px) rotate(15deg)`, opacity: 0.3}], {duration: 800, easing: "ease-in-out"}).onfinish = () => card.remove();
-  }
+  private async animate(event: Event): Promise<void> { await this.scene.play(event); }
 
   private async click(button: HTMLButtonElement): Promise<void> {
     const s = this.state, g = this.game(), kind = button.dataset.do;
@@ -223,14 +248,17 @@ class Application {
     if (kind === "ready") { await this.move({type: "ready", ready: !s?.players.find(p => p.id === s.me)?.ready}); return; }
     if (kind === "remove") { await this.host({type: "remove_player", player: button.dataset.player}); return; }
     if (kind === "mode") { this.mode = button.dataset.mode ?? ""; if (this.page === "testing") {this.editTarget = ""; $<HTMLSelectElement>("#edit-target").value = "";} this.renderGame(); return; }
-    const commands: Record<string, Action> = {roll: {type: "roll"}, "end-turn": {type: "end_turn"}, "buy-dev": {type: "buy_dev"}, "save-checkpoint": {type: "save"}, "end-vote": {type: "end_session"}};
+    const commands: Record<string, Action> = {"opening-roll": {type: "opening_roll"}, roll: {type: "roll"}, "end-turn": {type: "end_turn"}, "buy-dev": {type: "buy_dev"}, "save-checkpoint": {type: "save"}, "end-vote": {type: "end_session"}};
     if (kind && commands[kind]) { await this.move(commands[kind]!); return; }
-    if (kind === "steal") { await this.move({type: "steal", victim: button.dataset.player}); return; }
-    if (kind === "accept" || kind === "cancel-offer") { await this.move({type: kind === "accept" ? "accept_trade" : "cancel_trade", offer: Number(button.dataset.offer)}); return; }
+    if (kind === "choose-victim") { await this.move({type: "inspect_steal", victim: button.dataset.player}); return; }
+    if (["accept", "reject", "select-partner", "cancel-offer"].includes(kind ?? "")) {
+      const types: Record<string, string> = {accept: "accept_trade", reject: "reject_trade", "select-partner": "select_trade", "cancel-offer": "cancel_trade"};
+      await this.move({type: types[kind!]!, offer: Number(button.dataset.offer), player: button.dataset.player}); return;
+    }
     if (kind === "bank") { this.modal("Trade with the bank / ports", `<form id="bank-form"><p>Give <strong id="bank-ratio">${g?.ratios?.wood ?? 4}</strong> cards for 1.</p><label>Give<select id="bank-give" name="give">${options([...resources])}</select></label><label>Receive<select name="receive">${options(["brick", "wood", "wool", "wheat", "ore"])}</select></label><button class="primary">Trade</button></form>`); return; }
     if (kind === "trade") {
       const html = s?.players.filter(p => p.id !== s.me && (g?.active === s.me || p.id === g?.active)).map(p => `<option value="${h(p.id)}">${h(p.name)}</option>`).join("");
-      this.modal("Offer a player trade", `<form id="trade-form"><label>Recipient<select name="to">${g?.active === s?.me ? '<option value="">Anyone at the table</option>' : ""}${html}</select></label><h3>You give</h3><div class="resource-fields">${fields("give_")}</div><h3>You receive</h3><div class="resource-fields">${fields("want_")}</div><button class="primary">Make offer</button></form>`); return;
+      this.modal("Offer a player trade", `<form id="trade-form"><label>Recipients · select several; none means everyone eligible<select name="to" multiple size="5">${html}</select></label><h3>You give</h3><div class="resource-fields">${fields("give_")}</div><h3>You receive</h3><div class="resource-fields">${fields("want_")}</div><p>For a gift, select its recipient and leave one side empty. Acceptances are collected for five seconds. If several players accept, you choose the partner.</p><button class="primary">Make offer</button></form>`); return;
     }
     if (kind === "discard") { const action = this.actions().find(a => a.type === "discard"); this.modal("Choose cards to discard", `<form id="discard-form"><p>Discard exactly ${g?.discards[s!.me!]} resources.</p><div class="resource-fields">${fields("discard_", action?.resources as Bundle)}</div><button class="primary">Discard cards</button></form>`); return; }
     if (kind === "dev") {
@@ -262,7 +290,7 @@ class Application {
       case "bot-form": await this.host({type: "add_bot", name: value("name"), provider: value("provider"), model: value("model"), endpoint: value("endpoint"), timeout: Number(value("timeout"))}); form.reset(); return;
       case "bank-form": await this.move({type: "bank_trade", give: value("give"), receive: value("receive")}); return;
       case "configure-bot": await this.host({type: "configure_bot", player: value("player"), provider: value("provider"), model: value("model"), endpoint: value("endpoint"), timeout: Number(value("timeout")), api_key: value("api_key")}); return;
-      case "trade-form": await this.move({type: "offer_trade", to: value("to") || null, give: bundle(data, "give_"), want: bundle(data, "want_")}); return;
+      case "trade-form": { const targets = data.getAll("to").map(String); await this.move({type: "offer_trade", to: targets.length ? targets : this.game()?.active !== this.state?.me ? [this.game()!.active] : [], give: bundle(data, "give_"), want: bundle(data, "want_")}); return; }
       case "discard-form": await this.move({type: "discard", resources: bundle(data, "discard_")}); return;
       case "monopoly-form": await this.move({type: "play_dev", card: "monopoly", resource: value("resource")}); return;
       case "plenty-form": await this.move({type: "play_dev", card: "year_of_plenty", resources: bundle(data, "plenty_")}); return;

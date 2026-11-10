@@ -186,7 +186,7 @@ def test_disconnect_autosaves_and_reconnect_reclaims_same_seat(tmp_path):
 def test_local_model_adapter_uses_private_bounded_view_and_json(monkeypatch, provider):
     calls = []
 
-    def fake_post(url, body, timeout, api_key):
+    async def fake_post(url, body, timeout, api_key):
         calls.append((url, body, timeout))
         content = json.dumps({"choice": 0, "message": "Hello", "recipients": []})
         if provider == "openai":
@@ -215,14 +215,55 @@ def test_local_model_adapter_uses_private_bounded_view_and_json(monkeypatch, pro
     url, body, timeout = calls[0]
     if provider == "ollama":
         assert url.endswith("/api/chat") and body["keep_alive"] == "30m" and not body["think"]
-        assert body["options"]["num_predict"] <= 160
+        assert body["options"]["num_predict"] <= 512
     else:
-        assert url.endswith("/chat/completions") and body["max_tokens"] <= 160
+        assert url.endswith("/chat/completions") and body["max_tokens"] <= 512
         assert body["response_format"] == {"type": "json_object"}
+        assert body["reasoning_effort"] == "none"
     assert timeout == 2
     sent = json.loads(body["messages"][-1]["content"])["observation"]
-    assert len(sent["chat"]) == 8 and len(sent["chat"][0]["text"]) == 240
+    assert len(sent["chat"]) == 20 and len(sent["chat"][0]["text"]) == 600
     assert "resources" not in sent["game"]["players"]["b"]
+
+
+@pytest.mark.parametrize("content", ["", None])
+def test_reasoning_only_model_response_explains_missing_final_answer(monkeypatch, content):
+    async def fake_post(*args):
+        return {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": content, "reasoning_content": "Private reasoning"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(botlogic, "_post", fake_post)
+    with pytest.raises(ValueError, match="reasoning but no final JSON.*finish_reason=length"):
+        asyncio.run(
+            botlogic.ask_model(
+                {"provider": "openai", "model": "test", "endpoint": "http://localhost/v1"},
+                {},
+                [{"type": "end_turn"}],
+                [],
+            )
+        )
+
+
+def test_truncated_model_json_explains_output_limit(monkeypatch):
+    async def fake_post(*args):
+        return {"choices": [{"finish_reason": "length", "message": {"content": '{"choice":'}}]}
+
+    monkeypatch.setattr(botlogic, "_post", fake_post)
+    with pytest.raises(ValueError, match="output token limit"):
+        asyncio.run(
+            botlogic.ask_model(
+                {"provider": "openai", "model": "test", "endpoint": "http://localhost/v1"},
+                {},
+                [{"type": "end_turn"}],
+                [],
+            )
+        )
 
 
 def test_model_failure_uses_valid_fallback_and_saves_context(tmp_path, monkeypatch):
@@ -239,6 +280,7 @@ def test_model_failure_uses_valid_fallback_and_saves_context(tmp_path, monkeypat
                     {"type": "add_bot", "name": name, "provider": "ollama", "model": "test"}
                 )
             await session.host({"type": "start", "seed": "fallback"})
+            session.state["game"]["phase"] = "setup_settlement"
             before = session.state["revision"]
             pid = session.state["game"]["active"]
             await session._bot_step(

@@ -180,6 +180,12 @@ local model service, add an Ollama or OpenAI-compatible bot in the lobby, and en
 model name and endpoint. Full setup, latency controls, privacy, and troubleshooting are
 in [docs/LLM.md](./docs/LLM.md). Built-in bots can be used immediately without a model.
 
+Model seats can initiate public/private conversations and player trades, evaluate offers,
+and retain private alliance notes. Trades collect responses for five seconds before any
+exchange; multiple acceptances let the proposer pick a partner. See
+[trade timing and animation events](./docs/INTERACTIONS.md) for the exact rules and
+[parallel model setup](./docs/LLM.md#concurrent-inference-with-llamacpp) for multiple inference slots.
+
 ## Development and checks
 
 ```fish

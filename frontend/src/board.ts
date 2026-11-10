@@ -10,6 +10,8 @@ export class BoardRenderer {
   private game: Game | null = null;
   private seats: Seat[] = [];
   private scale = 50;
+  private angle = 0;
+  private hidden = new Map<string, number>();
   private x = 0;
   private y = 0;
   private width = 0;
@@ -76,6 +78,17 @@ export class BoardRenderer {
     if (key !== this.boardKey) { this.boardKey = key; this.fit(); }
     this.dirty = true;
   }
+  setRotation(angle: number): void { if (Math.abs(this.angle-angle)>.001) {this.angle=angle;this.fit();} }
+  hidePiece(id: string): void { this.hidden.set(id,(this.hidden.get(id) ?? 0)+1); this.dirty=true; }
+  showPiece(id: string): void { const n=(this.hidden.get(id) ?? 1)-1; if(n>0)this.hidden.set(id,n);else this.hidden.delete(id);this.dirty=true; }
+  clearHidden(): void { this.hidden.clear(); this.dirty=true; }
+  screenPoint(id: string): {x:number;y:number} {
+    const b=this.game?.board; if(!b)return {x:this.x,y:this.y};
+    const edge=b.edges[id], v=edge ? {x:(b.vertices[edge.a]!.x+b.vertices[edge.b]!.x)/2,y:(b.vertices[edge.a]!.y+b.vertices[edge.b]!.y)/2} : b.vertices[id] ?? b.tiles[id];
+    if(!v)return {x:this.x,y:this.y};
+    return {x:this.x+(v.x*Math.cos(this.angle)-v.y*Math.sin(this.angle))*this.scale,
+      y:this.y+(v.x*Math.sin(this.angle)+v.y*Math.cos(this.angle))*this.scale};
+  }
   animate(event: Event): void {
     this.animation = {at: performance.now(), ...(event.edge ? {edge: event.edge} : {}),
       ...(event.vertex ? {vertex: event.vertex} : {})};
@@ -91,12 +104,12 @@ export class BoardRenderer {
   fit(): void {
     if (!this.game) return;
     const vertices = Object.values(this.game.board.vertices);
-    const xs = vertices.map(v => v.x), ys = vertices.map(v => v.y);
+    const xs = vertices.map(v => v.x*Math.cos(this.angle)-v.y*Math.sin(this.angle)), ys = vertices.map(v => v.x*Math.sin(this.angle)+v.y*Math.cos(this.angle));
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    this.scale = Math.max(12, Math.min(this.width * 0.66 / (maxX - minX + 1.4),
-      this.height * 0.61 / (maxY - minY + 1.4)));
-    this.x = this.width * 0.51 - (minX + maxX) / 2 * this.scale;
-    this.y = this.height * 0.44 - (minY + maxY) / 2 * this.scale;
+    this.scale = Math.max(10, Math.min(this.width * 0.59 / (maxX - minX + 2.4),
+      this.height * 0.54 / (maxY - minY + 2.4)));
+    this.x = this.width * 0.53 - (minX + maxX) / 2 * this.scale;
+    this.y = this.height * 0.43 - (minY + maxY) / 2 * this.scale;
     this.dirty = true;
   }
   private resize(): void {
@@ -108,7 +121,8 @@ export class BoardRenderer {
   private pick(px: number, py: number): void {
     if (!this.game) return;
     const b = this.game.board;
-    const world = {x: (px - this.x) / this.scale, y: (py - this.y) / this.scale};
+    const sx=(px-this.x)/this.scale, sy=(py-this.y)/this.scale;
+    const world = {x:sx*Math.cos(this.angle)+sy*Math.sin(this.angle), y:-sx*Math.sin(this.angle)+sy*Math.cos(this.angle)};
     const candidates: {id: string; x: number; y: number; action?: Action}[] = [];
     if (this.adminTarget) {
       if (this.adminTarget === "vertex") for (const [id, v] of Object.entries(b.vertices)) candidates.push({id, ...v});
@@ -140,7 +154,8 @@ export class BoardRenderer {
     c.clearRect(0, 0, this.width, this.height);
     if (!this.game) return;
     const g = this.game, b = g.board;
-    c.translate(this.x, this.y); c.scale(this.scale, this.scale);
+    c.translate(this.x, this.y); c.scale(this.scale, this.scale); c.rotate(this.angle);
+    this.rim();
     const color = (pid: string | null) => this.seats.find(p => p.id === pid)?.color ?? "#eee";
     const allowed = new Set(this.actions.filter(a => a.type === this.mode).map(a => String(a.edge ?? a.vertex ?? a.tile)));
     const progress = Math.min(1, (performance.now() - this.animation.at) / 550);
@@ -177,10 +192,17 @@ export class BoardRenderer {
         const x = (a.x + v.x) / 2, y = (a.y + v.y) / 2;
         const tile = b.tiles[edge.tiles[0]!]!;
         const dx = x - tile.x, dy = y - tile.y;
-        c.strokeStyle = "#bda879"; c.lineWidth = 0.04; c.beginPath(); c.moveTo(x, y); c.lineTo(x + dx * 0.5, y + dy * 0.5); c.stroke();
-        c.fillStyle = "#eee0b7"; c.font = "bold 0.17px system-ui"; c.textAlign = "center";
-        c.fillText(edge.port === "any" ? "3:1" : `2:1 ${edge.port}`, x + dx * 0.8, y + dy * 0.8);
+        const length=Math.hypot(dx,dy), bx=x+dx/length*.79, by=y+dy/length*.79;
+        c.strokeStyle = "#d8ba7e"; c.lineWidth = 0.075; c.beginPath(); c.moveTo(a.x,a.y);c.lineTo(bx,by);c.moveTo(v.x,v.y);c.lineTo(bx,by);c.stroke();
+        c.save();c.translate(bx,by);c.rotate(-this.angle);
+        c.beginPath();c.roundRect(-.43,-.4,.86,.87,.13);c.fillStyle="#f1dfb5";c.fill();c.lineWidth=.035;c.strokeStyle="#725335";c.stroke();
+        c.save();c.translate(0,.1);c.scale(.46,.46);
+        if(edge.port==="any") { c.strokeStyle="#426f80";c.lineWidth=.08;c.beginPath();c.arc(0,-.4,.31,0,Math.PI*2);c.moveTo(-.4,-.4);c.lineTo(.4,-.4);c.moveTo(0,-.8);c.lineTo(0,0);c.stroke(); }
+        else this.terrain(edge.port);
+        c.restore();c.fillStyle="#314342";c.font="bold .22px system-ui";c.textAlign="center";c.fillText(edge.port==="any" ? "3:1" : "2:1",0,.31);
+        c.font=".10px system-ui";c.fillText(({wool:"Sheep",wood:"Wood",brick:"Brick",wheat:"Grain",ore:"Ore",any:"Any"} as Record<string,string>)[edge.port] ?? edge.port,0,-.25);c.restore();
       }
+      if (this.hidden.has(eid)) continue;
       if (edge.owner || allowed.has(eid) || this.adminTarget === "edge" && this.selected === eid) {
         const t = this.animation.edge === eid ? progress : 1;
         c.lineCap = "round"; c.lineWidth = edge.owner ? 0.13 : 0.08;
@@ -192,7 +214,7 @@ export class BoardRenderer {
       }
     }
     for (const [vid, vertex] of Object.entries(b.vertices)) {
-      const building = vertex.building;
+      const building = this.hidden.has(vid) ? null : vertex.building;
       if (building) {
         c.save(); c.translate(vertex.x, vertex.y);
         const t = this.animation.vertex === vid ? 0.3 + progress * 0.7 : 1; c.scale(t, t);
@@ -208,6 +230,18 @@ export class BoardRenderer {
         if (!building) { c.fillStyle = "#ffe7ad88"; c.fill(); }
       }
     }
+  }
+
+  private rim(): void {
+    const b=this.game!.board, c=this.ctx, v=Object.values(b.vertices);
+    const left=Math.min(...v.map(p=>p.x))-1.15,right=Math.max(...v.map(p=>p.x))+1.15;
+    const top=Math.min(...v.map(p=>p.y))-1.05,bottom=Math.max(...v.map(p=>p.y))+1.05, mid=(top+bottom)/2, width=right-left;
+    const corners=[[left+width*.25,top],[right-width*.25,top],[right,mid],[right-width*.25,bottom],[left+width*.25,bottom],[left,mid]];
+    c.save();c.beginPath();corners.forEach(([x,y],i)=>i?c.lineTo(x!,y!):c.moveTo(x!,y!));c.closePath();
+    c.fillStyle="#347995";c.fill();c.strokeStyle="#704f32";c.lineWidth=.24;c.stroke();c.strokeStyle="#dec28a";c.lineWidth=.1;c.stroke();c.clip();
+    c.strokeStyle="#9fd1d340";c.lineWidth=.025;
+    for(let y=top+.25;y<bottom;y+=.42) for(let x=left+.15;x<right;x+=.65){c.beginPath();c.moveTo(x,y);c.quadraticCurveTo(x+.15,y+.1,x+.32,y);c.stroke();}
+    c.restore();
   }
 
   private terrain(resource: string): void {

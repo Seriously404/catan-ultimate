@@ -12,7 +12,13 @@ import time
 from pathlib import Path
 
 from catan_server import botlogic, engine
-from catan_server.scenarios import decode_save, encode_save, scenario_edit, validate_game
+from catan_server.scenarios import (
+    decode_save,
+    encode_save,
+    scenario_edit,
+    validate_event,
+    validate_game,
+)
 from catan_server.storage import Store
 
 COLORS = ["#f16a63", "#63aaff", "#f4cc67", "#a89aff", "#5dd6ac", "#f4a364"]
@@ -36,6 +42,7 @@ def initial_session() -> dict:
         "paused": False,
         "pause_reason": "",
         "sandbox": None,
+        "presentation_until": 0,
     }
 
 
@@ -71,9 +78,34 @@ class Session:
         self.connected = {}
         self.bot_tasks = {}
         self.thinking = set()
+        self.warming = set()
         self.bot_errors = {}
         self.bot_cooldowns = {}
         self.bot_chat_seen = {}
+        self.bot_warmed = {}
+        self.clock = time.time
+        self.action_delay = max(0, min(5, float(os.getenv("CATAN_ACTION_DELAY", "0.8"))))
+        self.bot_social_interval = max(1, float(os.getenv("CATAN_BOT_SOCIAL_INTERVAL", "10")))
+        self.bot_social = {}
+        self.bot_next_social = {}
+        self.bot_offer_counts = {}
+        self.bot_next_message = {}
+        self.bot_waiting = {}
+        if self.state["game"]:
+            for offer in self.state["game"]["offers"]:
+                offer["to"] = (
+                    [offer["to"]] if isinstance(offer.get("to"), str) else offer.get("to") or []
+                )
+                offer.setdefault(
+                    "responses",
+                    dict.fromkeys(engine.offer_recipients(self.state["game"], offer), "pending"),
+                )
+                offer.setdefault("window_closed", False)
+                offer.setdefault("selecting", False)
+                if not offer["window_closed"]:
+                    offer.update(created_at=self.clock(), closes_at=self.clock() + 5)
+            if self.state["paused"]:
+                self.state["trade_paused_at"] = self.clock()
         self.inference = asyncio.Semaphore(max(1, int(os.getenv("CATAN_LLM_CONCURRENCY", "1"))))
         self.scheduler = None
 
@@ -143,6 +175,8 @@ class Session:
             "me": pid,
             "owner": owner,
             "paused": self.paused(),
+            "server_time": self.clock(),
+            "presentation_until": s.get("presentation_until", 0),
             "pause_reason": s["pause_reason"],
             "players": [
                 {
@@ -153,22 +187,21 @@ class Session:
                     "ready": p["ready"],
                     "online": self.online(p),
                     "thinking": p["id"] in self.thinking,
+                    "warming": p["id"] in self.warming,
                     "provider": p.get("config", {}).get("provider", "human"),
                 }
                 for p in s["players"]
             ],
             "chat": [m for m in s["chat"] if not m["to"] or pid in (m["from"], *m["to"])],
             "events": [],
-            "game": engine.player_view(s["game"], pid) if s["game"] else None,
+            "game": engine.player_view(s["game"], pid, now=self.clock()) if s["game"] else None,
         }
+        seat = next((p for p in s["players"] if p["id"] == pid), {})
+        result["private_strategy"] = seat.get("strategy", "")
         for raw in s["events"][-60:]:
-            event = raw.copy()
-            if event.get("type") == "steal" and pid not in (
-                event.get("actor"),
-                event.get("victim"),
-            ):
-                event.pop("resource", None)
-            result["events"].append(event)
+            event = engine.visible_event(raw, pid)
+            if event is not None:
+                result["events"].append(event)
         if owner:
             result.update(
                 raw_game=copy.deepcopy(s["game"]),
@@ -201,9 +234,134 @@ class Session:
         return result
 
     def commit(self, state: dict, actor: str, action: str) -> None:
+        if state.get("paused") and not self.state.get("paused"):
+            state["trade_paused_at"] = self.clock()
+        elif not state.get("paused") and self.state.get("paused"):
+            elapsed = max(0, self.clock() - self.state.get("trade_paused_at", self.clock()))
+            for offer in (state.get("game") or {}).get("offers", []):
+                if not offer.get("window_closed"):
+                    offer["created_at"] += elapsed
+                    offer["closes_at"] += elapsed
+            state.pop("trade_paused_at", None)
         state["revision"] = self.state["revision"] + 1
         self.store.commit(state, actor, action)
         self.state = state
+
+    def record_game_event(self, state: dict, before: dict) -> None:
+        event = state["game"]["last_event"].copy()
+        event.update(id=self.state["revision"] + 1, at=self.clock(), schema=1, effects=[])
+        for pid, data in state["game"]["players"].items():
+            delta = {
+                r: data["resources"][r] - before["players"][pid]["resources"][r]
+                for r in engine.RESOURCES
+            }
+            if any(delta.values()):
+                event["effects"].append(
+                    {
+                        "kind": "resources",
+                        "player": pid,
+                        "resources": delta,
+                        "count": sum(delta.values()),
+                        "gained": sum(max(0, n) for n in delta.values()),
+                        "spent": sum(max(0, -n) for n in delta.values()),
+                    }
+                )
+            cards = len(data["dev"]) - len(before["players"][pid]["dev"])
+            if cards:
+                event["effects"].append(
+                    {"kind": "development_cards", "player": pid, "count": cards}
+                )
+        paced = event["type"] in {
+            "opening_roll",
+            "inspect_steal",
+            "roll",
+            "build_road",
+            "build_settlement",
+            "build_city",
+            "move_robber",
+            "steal",
+            "bank_trade",
+            "trade_completed",
+            "buy_dev",
+            "play_dev",
+            "discard",
+            "end_turn",
+        }
+        event["awards"] = [
+            {"card": card, "from": before[card], "to": state["game"][card]}
+            for card in ("longest_road", "largest_army")
+            if before[card] != state["game"][card]
+        ]
+        timings = {
+            "roll": 2.4,
+            "opening_roll": 2.4,
+            "play_dev": 2.0,
+            "inspect_steal": 0.7,
+            "steal": 1.2,
+            "build_road": 1.2,
+            "build_settlement": 1.2,
+            "build_city": 1.2,
+            "buy_dev": 1.1,
+            "trade_completed": 1.2,
+            "bank_trade": 1.2,
+        }
+        duration = (
+            (
+                max(self.action_delay, timings.get(event["type"], self.action_delay))
+                + len(event["awards"]) * 1.8
+            )
+            if paced and self.action_delay
+            else 0
+        )
+        event["duration_ms"] = round(duration * 1000)
+        event.update(
+            turn=state["game"]["turn"], phase=state["game"]["phase"], active=state["game"]["active"]
+        )
+        event["next_roller"] = engine.next_roller(state["game"])
+        if event["type"] in ("roll", "opening_roll"):
+            event["dice"] = state["game"]["dice"].copy()
+        if event["type"] == "move_robber":
+            event["from_tile"] = before["robber"]
+        if event["type"] in ("steal", "inspect_steal"):
+            event["card_count"] = sum(before["players"][event["victim"]]["resources"].values())
+        event["starts_at"] = max(self.clock(), state.get("presentation_until", 0))
+        if duration:
+            state["presentation_until"] = event["starts_at"] + duration
+        state["game"]["last_event"] = event
+        state["events"] = (state["events"] + [event])[-100:]
+
+    async def settle_trades(self) -> None:
+        changed = False
+        async with self.lock:
+            for key in ("game", "sandbox"):
+                game = self.state[key]
+                if not game or game["winner"] or key == "game" and self.paused():
+                    continue
+                for offer_id in [o["id"] for o in game["offers"]]:
+                    game = self.state[key]
+                    offer = next((o for o in game["offers"] if o["id"] == offer_id), None)
+                    if not offer:
+                        continue
+                    due = not offer["window_closed"] and self.clock() >= offer["closes_at"]
+                    invalid = not engine.can_pay(game, offer["from"], offer["give"]) or any(
+                        answer == "accepted" and not engine.can_pay(game, p, offer["want"])
+                        for p, answer in offer["responses"].items()
+                    )
+                    if not due and not invalid:
+                        continue
+                    candidate = copy.deepcopy(self.state)
+                    candidate[key] = engine.apply(
+                        game,
+                        offer["from"],
+                        {"type": "settle_trade", "offer": offer_id},
+                        now=self.clock(),
+                    )
+                    if key == "game":
+                        self.record_game_event(candidate, game)
+                    self.commit(candidate, offer["from"], f"{key}_settle_trade")
+                    changed = True
+        if changed:
+            await self.broadcast()
 
     async def broadcast(self) -> None:
         cached = {}
@@ -310,7 +468,7 @@ class Session:
                 "from": pid,
                 "to": sorted(set(recipients)),
                 "text": text,
-                "at": time.time(),
+                "at": self.clock(),
             }
         )
         state["chat"] = state["chat"][-400:]
@@ -366,10 +524,21 @@ class Session:
                     not self.paused(),
                     "Game paused. All human seats must reconnect, or the host may end the session.",
                 )
-                candidate["game"] = engine.apply(candidate["game"], pid, c)
-                event = candidate["game"]["last_event"].copy()
-                event["id"] = self.state["revision"] + 1
-                candidate["events"] = (candidate["events"] + [event])[-100:]
+                engine.require(kind != "settle_trade", "Trade settlement is managed by the server")
+                if kind not in (
+                    "accept_trade",
+                    "reject_trade",
+                    "select_trade",
+                    "cancel_trade",
+                    "offer_trade",
+                ):
+                    engine.require(
+                        self.clock() >= candidate.get("presentation_until", 0),
+                        "Previous action is still being presented; try again shortly",
+                    )
+                before = candidate["game"]
+                candidate["game"] = engine.apply(before, pid, c, now=self.clock())
+                self.record_game_event(candidate, before)
             candidate["receipts"] = (
                 candidate["receipts"] + [{"id": command_id, "actor": pid, "signature": signature}]
             )[-300:]
@@ -523,8 +692,13 @@ class Session:
             elif kind in ("test_command", "admin_command"):
                 key = "sandbox" if kind == "test_command" else "game"
                 engine.require(candidate[key] is not None, "Create a game/scenario first")
-                candidate[key] = engine.apply(candidate[key], c.get("player"), c["command"])
+                before = candidate[key]
+                candidate[key] = engine.apply(
+                    before, c.get("player"), c["command"], now=self.clock()
+                )
                 candidate[key]["modified"] = True
+                if key == "game":
+                    self.record_game_event(candidate, before)
             elif kind == "rig_dice":
                 engine.require(candidate["game"] is not None, "Start a game first")
                 dice = c.get("dice")
@@ -577,8 +751,17 @@ class Session:
                 if pair[0] == c.get("player"):
                     await ws.close(code=1012)
         if kind == "configure_bot":
+            task = self.bot_tasks.get(c.get("player"))
+            if task and not task.done():
+                task.cancel()
+            self.bot_warmed.pop(c.get("player"), None)
             self.bot_cooldowns.pop(c.get("player"), None)
             self.bot_errors.pop(c.get("player"), None)
+        if kind in ("end_game", "remove_player"):
+            for pid, task in self.bot_tasks.items():
+                if kind == "end_game" or pid == c.get("player"):
+                    task.cancel()
+                    self.bot_warmed.pop(pid, None)
         await self.broadcast()
         return response
 
@@ -614,32 +797,22 @@ class Session:
                 p["config"] = bot_config(p.get("config", {}))
             p["ready"] = True
             p["memory"] = p.get("memory", [])[-12:]
+            p["strategy"] = str(p.get("strategy", ""))[:2400]
             ids.append(p["id"])
         engine.require(len(set(ids)) == len(ids), "Duplicate seats")
         game = validate_game(candidate["game"]) if candidate.get("game") else None
+        if game:
+            for offer in game["offers"]:
+                if not offer["window_closed"]:
+                    offer.update(created_at=self.clock(), closes_at=self.clock() + 5)
         engine.require(
             game is not None and set(game["players"]) == set(ids), "Seat list and game disagree"
         )
         restored = initial_session()
         restored.update(players=players, game=game, paused=True, pause_reason="disconnect")
+        restored["trade_paused_at"] = self.clock()
         for event in candidate.get("events", [])[-100:]:
-            engine.require(
-                isinstance(event, dict)
-                and isinstance(event.get("type"), str)
-                and isinstance(event.get("text"), str)
-                and len(event["text"]) <= 1000,
-                "Invalid saved game event",
-            )
-            clean = {
-                k: event[k]
-                for k in ("type", "text", "actor", "edge", "vertex", "tile", "victim", "resource")
-                if k in event
-            }
-            engine.require(
-                all(isinstance(v, str) and len(v) <= 1000 for v in clean.values()),
-                "Invalid event fields",
-            )
-            restored["events"].append(clean)
+            restored["events"].append(validate_event(event, ids))
         # Validate chat independently; never accept arbitrary executable serialized objects.
         for m in candidate.get("chat", [])[-400:]:
             timestamp = m.get("at", 0)
@@ -674,43 +847,103 @@ class Session:
             await ws.close(code=1012)
         await self.broadcast()
 
+    def bot_actions(self, pid: str) -> list[dict]:
+        game = self.state["game"]
+        actions = engine.legal_actions(game, pid, now=self.clock())
+        if not game:
+            return []
+        key = (self.state["game_id"], game["turn"], pid)
+        result = []
+        for action in actions:
+            kind = action["type"]
+            if kind == "offer_trade" and self.bot_offer_counts.get(key, 0) >= 2:
+                continue
+            if kind == "cancel_trade":
+                offer = next(o for o in game["offers"] if o["id"] == action["offer"])
+                if self.clock() < offer["created_at"] + 30:
+                    continue
+            if self.clock() < self.state.get("presentation_until", 0) and kind not in (
+                "accept_trade",
+                "reject_trade",
+                "select_trade",
+                "offer_trade",
+                "cancel_trade",
+            ):
+                continue
+            result.append(action)
+        return result
+
     async def _bots(self) -> None:
         while True:
-            await asyncio.sleep(0.35)
-            if self.paused():
+            await asyncio.sleep(0.25)
+            await self.settle_trades()
+            game = self.state["game"]
+            if game and game["winner"]:
                 continue
+            if game:
+                self.bot_offer_counts = {
+                    k: v
+                    for k, v in self.bot_offer_counts.items()
+                    if k[:2] == (self.state["game_id"], game["turn"])
+                }
             for p in self.state["players"]:
                 pid = p["id"]
                 if not p["bot"] or pid in self.bot_tasks and not self.bot_tasks[pid].done():
                     continue
-                actions = engine.legal_actions(self.state["game"], pid)
-                actionable = [
-                    a
-                    for a in actions
-                    if a["type"] != "accept_trade"
-                    or any(
-                        o["id"] == a["offer"] and sum(o["give"].values()) >= sum(o["want"].values())
-                        for o in self.state["game"]["offers"]
-                    )
-                ]
-                messages = [
-                    m
-                    for m in self.state["chat"]
-                    if m["from"] != pid
-                    and not next(
-                        (s["bot"] for s in self.state["players"] if s["id"] == m["from"]), True
-                    )
+                actions = [] if self.paused() else self.bot_actions(pid)
+                view = self.view(pid)
+                incoming = [m for m in view["chat"] if m["from"] != pid]
+                latest = incoming[-1]["id"] if incoming else ""
+                last_event = view["events"][-1]["id"] if view["events"] else 0
+                waiting_event, waiting_chat, retry_at = self.bot_waiting.get(pid, (None, None, 0))
+                if (last_event, latest) == (
+                    waiting_event,
+                    waiting_chat,
+                ) and self.clock() < retry_at:
+                    actions = []
+                humans = {s["id"] for s in self.state["players"] if not s["bot"]}
+                human_message = next(
+                    (m["id"] for m in reversed(incoming) if m["from"] in humans), ""
+                )
+                event = next(
+                    (e["id"] for e in reversed(view["events"]) if e.get("actor") != pid), 0
+                )
+                signal = (self.state["game_id"], event, human_message)
+                old_signal, count = self.bot_social.get(pid, (None, 0))
+                if signal != old_signal:
+                    count = 0
+                direct = bool(
+                    incoming
                     and (
-                        pid in m["to"]
-                        or not m["to"]
-                        and f"@{p['name']}".casefold() in m["text"].casefold()
+                        pid in incoming[-1]["to"]
+                        or f"@{p['name']}".casefold() in incoming[-1]["text"].casefold()
                     )
-                ]
-                latest = messages[-1]["id"] if messages else ""
-                chat_due = latest and latest != self.bot_chat_seen.get(pid)
-                if actionable or chat_due:
+                )
+                changed = signal != old_signal or latest != self.bot_chat_seen.get(pid, "")
+                social = (
+                    p["config"]["provider"] != "builtin"
+                    and changed
+                    and count < 2
+                    and (
+                        self.clock() >= self.bot_next_social.get(pid, 0)
+                        or direct
+                        and incoming[-1]["from"] in humans
+                    )
+                )
+                # Dummies only answer humans; they must not create automatic bot reply loops.
+                if p["config"]["provider"] == "builtin":
+                    social = (
+                        direct
+                        and bool(latest)
+                        and incoming[-1]["from"] in humans
+                        and latest != self.bot_chat_seen.get(pid)
+                    )
+                if actions or social:
+                    if social:
+                        self.bot_social[pid] = (signal, count + 1)
+                        self.bot_next_social[pid] = self.clock() + self.bot_social_interval
                     self.bot_tasks[pid] = asyncio.create_task(
-                        self._bot_step(pid, actionable, bool(chat_due), latest)
+                        self._bot_step(pid, actions, social, latest)
                     )
 
     async def _bot_step(self, pid: str, actions: list[dict], chat_due: bool, latest: str) -> None:
@@ -718,122 +951,226 @@ class Session:
         if not p:
             return
         config = p["config"]
-        generation = self.state.get("game_id")
-        game = self.state["game"]
-        decision = {}
-        action = None
-        # Mandatory bookkeeping (rolling/discarding/stealing) needs no model round trip.
-        if actions:
-            g = copy.deepcopy(game)
-            g["view_ratios"] = engine.trade_ratios(game, pid)
-            action = botlogic.choose_builtin(g, pid, actions)
-        strategic = game and game["phase"] in ("action", "setup_settlement", "setup_road", "robber")
-        use_model = config["provider"] != "builtin" and (chat_due or strategic and len(actions) > 1)
+        generation = self.state["game_id"]
+        decision, action = {}, None
+
+        def fallback(options):
+            if not options or not self.state["game"]:
+                return None
+            g = copy.deepcopy(self.state["game"])
+            g["view_ratios"] = engine.trade_ratios(g, pid)
+            return botlogic.choose_builtin(g, pid, options)
+
+        action = fallback(actions)
+        # An unaffordable offer can be rejected immediately without inference.
+        only_reject = any(
+            a["type"] == "reject_trade"
+            and not any(b["type"] == "accept_trade" and b["offer"] == a["offer"] for b in actions)
+            for a in actions
+        )
+        if only_reject:
+            action = next(
+                a
+                for a in actions
+                if a["type"] == "reject_trade"
+                and not any(
+                    b["type"] == "accept_trade" and b["offer"] == a["offer"] for b in actions
+                )
+            )
+        use_model = (
+            config["provider"] != "builtin" and (bool(actions) or chat_due) and not only_reject
+        )
         use_model = use_model and time.monotonic() >= self.bot_cooldowns.get(pid, 0)
         if use_model:
             self.thinking.add(pid)
             await self.broadcast()
             try:
-                # A bounded menu keeps prompts small without hiding the full legal list in the API.
-                ranked = sorted(actions, key=lambda a: a == action, reverse=True)[:80]
-
-                async def infer():
-                    async with self.inference:
-                        return await botlogic.ask_model(
-                            config, self.view(pid), ranked, p.get("memory", []), not actions
-                        )
-
-                decision = await asyncio.wait_for(
-                    infer(), (min(config["timeout"], 3) if not actions else config["timeout"]) + 0.5
-                )
+                async with self.inference:
+                    if generation != self.state["game_id"] or self.paused() and not chat_due:
+                        return
+                    ranked = self.rank_actions(actions, action)
+                    warm_key = (generation, tuple(sorted(config.items())))
+                    if self.bot_warmed.get(pid) != warm_key:
+                        self.warming.add(pid)
+                        await self.broadcast()
+                        try:
+                            await botlogic.ask_model(
+                                config,
+                                self.view(pid),
+                                ranked,
+                                p.get("memory", []),
+                                not actions,
+                                warmup=True,
+                            )
+                        finally:
+                            self.warming.discard(pid)
+                        self.bot_warmed[pid] = warm_key
+                        await self.broadcast()
+                    if generation != self.state["game_id"] or self.paused() and not chat_due:
+                        return
+                    actions = [] if self.paused() else self.bot_actions(pid)
+                    action = fallback(actions)
+                    if not actions and not chat_due:
+                        return
+                    ranked = self.rank_actions(actions, action)
+                    observation = self.view(pid)
+                    incoming = [m for m in observation["chat"] if m["from"] != pid]
+                    latest = incoming[-1]["id"] if incoming else ""
+                    decision = await botlogic.ask_model(
+                        config, observation, ranked, p.get("memory", []), not actions
+                    )
                 choice = decision.get("choice")
-                if actions and type(choice) is int and 0 <= choice < len(ranked):
-                    action = ranked[choice]
-                if (
-                    actions
-                    and isinstance(decision.get("command"), dict)
-                    and decision["command"].get("type") == "offer_trade"
-                ):
-                    action = decision["command"]
+                action = (
+                    ranked[choice] if type(choice) is int and 0 <= choice < len(ranked) else None
+                )
+                proposed = decision.get("command")
+                if isinstance(proposed, dict) and proposed.get("type") in {
+                    "offer_trade",
+                    "accept_trade",
+                    "reject_trade",
+                    "select_trade",
+                    "cancel_trade",
+                    "roll",
+                    "opening_roll",
+                    "inspect_steal",
+                    "end_turn",
+                    "build_road",
+                    "build_settlement",
+                    "build_city",
+                    "buy_dev",
+                    "play_dev",
+                    "move_robber",
+                    "steal",
+                    "discard",
+                    "bank_trade",
+                }:
+                    action = proposed
                 self.bot_errors.pop(pid, None)
             except Exception as exc:
+                self.bot_warmed.pop(pid, None)
                 self.bot_cooldowns[pid] = time.monotonic() + 30
                 self.bot_errors[pid] = (
                     f"{type(exc).__name__}: {str(exc)[:160]} — using fast fallback"
                 )
+                action = fallback(self.bot_actions(pid))
             finally:
                 self.thinking.discard(pid)
-        if chat_due:
+        if latest:
             self.bot_chat_seen[pid] = latest
         try:
-            # Re-read after inference; server validation is always the final authority.
-            if (
-                self.paused()
-                or generation != self.state.get("game_id")
-                or not any(x["id"] == pid for x in self.state["players"])
+            if generation != self.state["game_id"] or not any(
+                x["id"] == pid for x in self.state["players"]
             ):
                 return
-            message = decision.get("message", "")
-            if isinstance(message, str) and message.strip():
-                recipients = decision.get("recipients", [])
-                if not isinstance(recipients, list):
-                    recipients = []
-                recipients = [
-                    r
-                    for r in recipients
-                    if isinstance(r, str) and r in {x["id"] for x in self.state["players"]}
-                ]
+            messages = decision.get("messages", [])
+            if not isinstance(messages, list):
+                messages = []
+            if decision.get("message") and not messages:
+                recipients = decision.get("recipients")
                 incoming = next((m for m in self.state["chat"] if m["id"] == latest), None)
-                if not recipients and incoming and incoming["to"]:
-                    recipients = list({incoming["from"], *incoming["to"]} - {pid})
-                await self.command(
-                    pid,
-                    {"type": "chat", "text": message[:500], "to": recipients},
-                    secrets.token_hex(12),
-                )
-            elif chat_due:
+                if not recipients:
+                    recipients = (
+                        list({incoming["from"], *incoming["to"]} - {pid})
+                        if incoming and incoming["to"]
+                        else []
+                    )
+                messages = [{"text": decision["message"], "to": recipients}]
+            allowed = {s["id"] for s in self.state["players"]}
+            sent = []
+            if self.clock() >= self.bot_next_message.get(pid, 0):
+                for message in messages[:3]:
+                    if not isinstance(message, dict):
+                        continue
+                    recipients, text = message.get("to", []), message.get("text", "")
+                    # Invalid private recipients must never silently turn into a public message.
+                    if (
+                        not isinstance(text, str)
+                        or not text.strip()
+                        or not isinstance(recipients, list)
+                        or not all(isinstance(r, str) and r in allowed for r in recipients)
+                    ):
+                        continue
+                    await self.command(
+                        pid,
+                        {"type": "chat", "text": text[:1200], "to": recipients},
+                        secrets.token_hex(12),
+                    )
+                    sent.append({"text": text[:1200], "to": recipients})
+                if sent:
+                    self.bot_next_message[pid] = self.clock() + 4
+            if not sent and chat_due and config["provider"] == "builtin":
                 incoming = next((m for m in self.state["chat"] if m["id"] == latest), None)
                 await self.command(
                     pid,
                     {
                         "type": "chat",
-                        "text": (
-                            "My model is unavailable; I'm using a fallback player for now."
-                            if config["provider"] != "builtin"
-                            else "I'm ready to trade. Send me a trade offer when it's legal."
-                        ),
-                        "to": [incoming["from"]] if incoming and incoming["to"] else [],
+                        "text": "Send me a trade offer and I'll consider it.",
+                        "to": list({incoming["from"], *incoming["to"]} - {pid})
+                        if incoming and incoming["to"]
+                        else [],
                     },
                     secrets.token_hex(12),
                 )
-            if action:
-                try:
-                    await self.command(pid, action, secrets.token_hex(12))
-                except engine.RuleError:
-                    fresh = engine.legal_actions(self.state["game"], pid)
-                    if fresh:
-                        g = copy.deepcopy(self.state["game"])
-                        g["view_ratios"] = engine.trade_ratios(g, pid)
-                        await self.command(
-                            pid, botlogic.choose_builtin(g, pid, fresh), secrets.token_hex(12)
-                        )
+            action_result = "waited"
+            if action and not self.paused() and generation == self.state["game_id"]:
+                if action["type"] == "offer_trade":
+                    current = self.state["game"]
+                    key = (generation, current["turn"], pid)
+                    if self.bot_offer_counts.get(key, 0) >= 2:
+                        action = None
+                if action:
+                    try:
+                        await self.command(pid, action, secrets.token_hex(12))
+                        action_result = "accepted"
+                        if action["type"] == "offer_trade":
+                            self.bot_offer_counts[key] = self.bot_offer_counts.get(key, 0) + 1
+                    except engine.RuleError as exc:
+                        action_result = f"Rejected: {exc}"
+                        fresh = self.bot_actions(pid)
+                        replacement = fallback(fresh)
+                        if replacement and replacement["type"] != "offer_trade":
+                            await self.command(pid, replacement, secrets.token_hex(12))
+                            action = replacement
+                            action_result += "; used a legal fallback"
+            if use_model and action is None:
+                view = self.view(pid)
+                event_id = view["events"][-1]["id"] if view["events"] else 0
+                self.bot_waiting[pid] = (event_id, latest, self.clock() + self.bot_social_interval)
             if use_model:
                 async with self.lock:
+                    if generation != self.state["game_id"]:
+                        return
                     candidate = copy.deepcopy(self.state)
                     seat = next((s for s in candidate["players"] if s["id"] == pid), None)
                     if seat:
+                        memory = decision.get("memory")
+                        if isinstance(memory, str) and memory.strip():
+                            seat["strategy"] = memory[:2400]
                         seat["memory"] = (
                             seat.get("memory", [])
                             + [
                                 {
+                                    "result": action_result,
                                     "action": action,
-                                    "message": str(message)[:500],
-                                    "plan": str(decision.get("memory", ""))[:600],
+                                    "messages": sent,
+                                    "plan": seat.get("strategy", "")[:1200],
                                 }
                             ]
                         )[-12:]
                         self.commit(candidate, pid, "bot_context")
         except (engine.RuleError, TypeError, ValueError, KeyError):
-            pass  # Another seat may have changed the phase while the model was thinking.
+            pass  # A concurrent action may have invalidated this decision.
         finally:
             await self.broadcast()
+
+    @staticmethod
+    def rank_actions(actions: list[dict], preferred: dict | None) -> list[dict]:
+        # Always retain offer responses and partner choices before trimming large build menus.
+        priorities = {
+            "reject_trade": 0,
+            "accept_trade": 0,
+            "select_trade": 0,
+            "cancel_trade": 1,
+            "offer_trade": 2,
+        }
+        return sorted(actions, key=lambda a: (priorities.get(a["type"], 3), a != preferred))[:100]
